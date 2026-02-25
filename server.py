@@ -1016,7 +1016,7 @@ async def update_llm_config(request):
         if providers:
             # 逐个更新各提供商的配置
             for provider, provider_config in providers.items():
-                if provider not in ['zhipu', 'siliconflow', '302ai', 'ollama', 'custom']:
+                if provider not in ['zhipu', 'zai', 'siliconflow', '302ai', 'ollama', 'custom']:
                     continue
                     
                 model = provider_config.get('model')
@@ -1077,7 +1077,7 @@ async def update_vision_config(request):
         if providers:
             # 逐个更新各提供商的配置
             for provider, provider_config in providers.items():
-                if provider not in ['zhipu', 'siliconflow', '302ai', 'ollama', 'custom']:
+                if provider not in ['zhipu', 'zai', 'siliconflow', '302ai', 'ollama', 'custom']:
                     continue
                     
                 model = provider_config.get('model')
@@ -1842,7 +1842,7 @@ async def get_models_list(request):
     """
     获取模型列表API
     请求参数:
-    - provider: 服务提供商 (zhipu, siliconflow, 302ai, ollama, custom)
+    - provider: 服务提供商 (zhipu, zai, siliconflow, 302ai, ollama, custom)
     - model_type: 模型类型 ('llm' 或 'vision')
     - recommended: 是否获取推荐列表 (可选，默认False)
     """

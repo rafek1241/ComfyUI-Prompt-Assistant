@@ -19,8 +19,8 @@ from typing import Dict, Any, List
 THINKING_CONTROL_RULES: List[Dict[str, Any]] = [
     {
         "name": "zhipu_glm",
-        "description": "智谱GLM-4.5/4.6系列",
-        "patterns": [r"glm[-_/.]?4\.(5|6)"],
+        "description": "智谱/GLM API模型系列",
+        "patterns": [r"glm[-_/.]?(5|4\.(5|6|7))"],
         "params": {"thinking": {"type": "disabled"}},
         "sources": ["智谱官方API", "各聚合平台"]
     },
