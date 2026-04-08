@@ -54,6 +54,40 @@ class OpenAICompatibleService(BaseAPIService):
     
     # ---已知的API端点路径（用于智能检测）---
     _known_endpoints = ['/chat/completions', '/v1/messages', '/completions']
+
+    @staticmethod
+    def _is_zai_provider(provider_display_name: str, base_url: str) -> bool:
+        """检测是否为 z.ai 服务。"""
+        provider_text = (provider_display_name or "").lower()
+        url_text = (base_url or "").lower()
+        return ("z.ai" in provider_text) or ("api.z.ai" in url_text)
+
+    @staticmethod
+    def _is_zai_balance_error(error_msg: str) -> bool:
+        """检测 z.ai 余额/资源包不足错误。"""
+        text = (error_msg or "").lower()
+        return (
+            "insufficient balance" in text or
+            "no resource package" in text or
+            "账户余额不足" in text or
+            "资源包" in text
+        )
+
+    @staticmethod
+    def _get_zai_fallback_model(model: str) -> Optional[str]:
+        """z.ai 轻量套餐模型兜底映射。"""
+        if not model:
+            return None
+        fallback_map = {
+            "glm-5": "glm-4.7-flash",
+            "glm-4.7": "glm-4.7-flash",
+            "glm-4.6": "glm-4.5-flash",
+            "glm-4.5": "glm-4.5-flash",
+            "glm-4.5-air": "glm-4.5-flash",
+            "glm-4.5-x": "glm-4.5-flash",
+            "glm-4.5-airx": "glm-4.5-flash"
+        }
+        return fallback_map.get(model.strip().lower())
     
     @staticmethod
     def parse_api_url(raw_url: str) -> str:
@@ -228,181 +262,217 @@ class OpenAICompatibleService(BaseAPIService):
             start_time = time.perf_counter()
             last_error_msg = ""
             
-            # 三级降级重试循环 (Level 0 -> Level 2)
-            for retry_level in range(3):
-                current_payload = cls._filter_payload(initial_payload, retry_level)
-                
-                # 如果不是Level 0，打印降级重试警告（换行输出）
-                if retry_level > 0:
-                    removed_keys = set(initial_payload.keys()) - set(current_payload.keys())
-                    removed_str = ", ".join(removed_keys) if removed_keys else "无参数变动"
-                    print(f"\n{WARN_PREFIX} ⚠️ HTTP 400错误, 触发Level-{retry_level}降级重试 | 服务:{provider_display_name} | 移除参数:[{removed_str}]", flush=True)
-                    
-                    # 关键修复：停止旧的进度条后再创建新的，防止线程泄漏
+            provider_is_zai = cls._is_zai_provider(provider_display_name, base_url)
+            fallback_model = cls._get_zai_fallback_model(model) if provider_is_zai else None
+            candidate_models = [model]
+            if fallback_model and fallback_model != model:
+                candidate_models.append(fallback_model)
+
+            for model_index, candidate_model in enumerate(candidate_models):
+                # 仅在首轮出现 z.ai 余额/套餐错误时触发模型降级
+                if model_index > 0 and not cls._is_zai_balance_error(last_error_msg):
+                    break
+
+                if model_index > 0:
+                    print(
+                        f"\n{WARN_PREFIX} z.ai套餐限制，自动切换模型重试 | {model} -> {candidate_model}",
+                        flush=True
+                    )
                     if pbar:
                         try:
-                            pbar.error(f"Retry Level {retry_level}...") # 标记前一个进度条为错误/重试状态
+                            pbar.error(f"模型降级重试: {candidate_model}")
                         except:
                             pbar._stop_timer()
-
-                    
-                    # 重新创建进度条用于新一轮重试
                     pbar = ProgressBar(
                         request_id=request_id,
                         service_name=provider_display_name,
-                        extra_info=f"Retry-{retry_level}",
+                        extra_info=f"Fallback-{candidate_model}",
                         streaming=is_streaming_progress_enabled(),
                         task_type=task_type,
                         source=source
                     )
-                
-                async def _do_stream_request():
-                    nonlocal pbar
+
+                initial_payload["model"] = candidate_model
+
+                # 三级降级重试循环 (Level 0 -> Level 2)
+                for retry_level in range(3):
+                    current_payload = cls._filter_payload(initial_payload, retry_level)
                     
-                    # 定义请求核心逻辑
-                    async def _request_core():
-                        async with client.stream('POST', url, headers=headers, json=current_payload, follow_redirects=True) as response:
-                            if response.status_code != 200:
-                                error_text = await response.aread()
-                                try:
-                                    error_data = json.loads(error_text)
-                                    msg = error_data.get('error', {}).get('message', f'HTTP {response.status_code}')
-                                except:
-                                    msg = f'HTTP {response.status_code}: {error_text.decode("utf-8", errors="ignore")[:200]}'
-                                
-                                # 智能识别认证错误
-                                from ..utils.common import _is_auth_error
-                                if response.status_code == 401 or _is_auth_error(msg.lower()):
-                                    msg = "API Key无效或缺失"
-                                
-                                return {
-                                    "success": False, 
-                                    "error": msg, 
-                                    "status_code": response.status_code,
-                                    "should_retry": response.status_code == 400
-                                }
-                            
-                            full_content = ""
-                            reasoning_content = ""
-                            
-                            async for line in response.aiter_lines():
-                                # 此处的循环检查依然保留，作为双重保险
-                                if cancel_event is not None and cancel_event.is_set():
-                                    raise asyncio.CancelledError()
-                                
-                                if not line or line == "data: [DONE]" or line == "data:[DONE]": continue
-                                if line.startswith("data: "): line = line[6:]
-                                elif line.startswith("data:"): line = line[5:]
-                                
-                                try:
-                                    chunk = json.loads(line)
-                                    # --- 调试日志 (2级): 输出原始流式数据 ---
-                                    # print(f"[DEBUG-2] Chunk: {line[:200]}...", flush=True)
+                    # 如果不是Level 0，打印降级重试警告（换行输出）
+                    if retry_level > 0:
+                        removed_keys = set(initial_payload.keys()) - set(current_payload.keys())
+                        removed_str = ", ".join(removed_keys) if removed_keys else "无参数变动"
+                        print(f"\n{WARN_PREFIX} ⚠️ HTTP 400错误, 触发Level-{retry_level}降级重试 | 服务:{provider_display_name} | 移除参数:[{removed_str}]", flush=True)
+                        
+                        # 关键修复：停止旧的进度条后再创建新的，防止线程泄漏
+                        if pbar:
+                            try:
+                                pbar.error(f"Retry Level {retry_level}...") # 标记前一个进度条为错误/重试状态
+                            except:
+                                pbar._stop_timer()
+
+                        
+                        # 重新创建进度条用于新一轮重试
+                        pbar = ProgressBar(
+                            request_id=request_id,
+                            service_name=provider_display_name,
+                            extra_info=f"Retry-{retry_level}",
+                            streaming=is_streaming_progress_enabled(),
+                            task_type=task_type,
+                            source=source
+                        )
+                    
+                    async def _do_stream_request():
+                        nonlocal pbar
+                        
+                        # 定义请求核心逻辑
+                        async def _request_core():
+                            async with client.stream('POST', url, headers=headers, json=current_payload, follow_redirects=True) as response:
+                                if response.status_code != 200:
+                                    error_text = await response.aread()
+                                    try:
+                                        error_data = json.loads(error_text)
+                                        msg = error_data.get('error', {}).get('message', f'HTTP {response.status_code}')
+                                    except:
+                                        msg = f'HTTP {response.status_code}: {error_text.decode("utf-8", errors="ignore")[:200]}'
                                     
-                                    if chunk.get('choices'):
-                                        delta = chunk['choices'][0].get('delta', {})
-                                        content = delta.get('content', '') or ''
-                                        # 针对不同厂商的推理字段进行广谱捕获
-                                        reasoning = (
-                                            delta.get('reasoning_content', '') or 
-                                            delta.get('reasoning', '') or 
-                                            delta.get('thinking', '') or 
-                                            delta.get('thinking_process', '') or  # 备选
-                                            ''
-                                        )
-                                        if reasoning: reasoning_content += reasoning
-                                        if content:
-                                            full_content += content
-                                            if stream_callback: stream_callback(content)
-                                            pbar.set_generating(len(full_content))
-                                            pbar.update(len(full_content))
-                                except:
-                                    continue
-                            
-                            final_content = full_content
-                            if reasoning_content:
-                                final_content = f"<think>{reasoning_content}</think>\n{full_content}"
-                            
-                            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                            if not final_content.strip():
-                                pbar.error("响应内容为空")
-                                # --- 调试日志 (1级): 警告响应内容为空 ---
-                                print(f"\n{WARN_PREFIX} [API响应调试] 模型:{model} | 状态:成功 | 但最终内容为空字符串", flush=True)
-                            else:
-                                pbar.done(char_count=len(final_content), elapsed_ms=elapsed_ms)
-                            
-                            return {"success": True, "content": final_content}
+                                    # 智能识别认证错误
+                                    from ..utils.common import _is_auth_error
+                                    if response.status_code == 401 or _is_auth_error(msg.lower()):
+                                        msg = "API Key无效或缺失"
+                                    
+                                    return {
+                                        "success": False, 
+                                        "error": msg, 
+                                        "status_code": response.status_code,
+                                        "should_retry": response.status_code == 400
+                                    }
+                                
+                                full_content = ""
+                                reasoning_content = ""
+                                
+                                async for line in response.aiter_lines():
+                                    # 此处的循环检查依然保留，作为双重保险
+                                    if cancel_event is not None and cancel_event.is_set():
+                                        raise asyncio.CancelledError()
+                                    
+                                    if not line or line == "data: [DONE]" or line == "data:[DONE]": continue
+                                    if line.startswith("data: "): line = line[6:]
+                                    elif line.startswith("data:"): line = line[5:]
+                                    
+                                    try:
+                                        chunk = json.loads(line)
+                                        # --- 调试日志 (2级): 输出原始流式数据 ---
+                                        # print(f"[DEBUG-2] Chunk: {line[:200]}...", flush=True)
+                                        
+                                        if chunk.get('choices'):
+                                            delta = chunk['choices'][0].get('delta', {})
+                                            content = delta.get('content', '') or ''
+                                            # 针对不同厂商的推理字段进行广谱捕获
+                                            reasoning = (
+                                                delta.get('reasoning_content', '') or 
+                                                delta.get('reasoning', '') or 
+                                                delta.get('thinking', '') or 
+                                                delta.get('thinking_process', '') or  # 备选
+                                                ''
+                                            )
+                                            if reasoning: reasoning_content += reasoning
+                                            if content:
+                                                full_content += content
+                                                if stream_callback: stream_callback(content)
+                                                pbar.set_generating(len(full_content))
+                                                pbar.update(len(full_content))
+                                    except:
+                                        continue
+                                
+                                final_content = full_content
+                                if reasoning_content:
+                                    final_content = f"<think>{reasoning_content}</think>\n{full_content}"
+                                
+                                elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+                                if not final_content.strip():
+                                    pbar.error("响应内容为空")
+                                    # --- 调试日志 (1级): 警告响应内容为空 ---
+                                    print(f"\n{WARN_PREFIX} [API响应调试] 模型:{candidate_model} | 状态:成功 | 但最终内容为空字符串", flush=True)
+                                else:
+                                    pbar.done(char_count=len(final_content), elapsed_ms=elapsed_ms)
+                                
+                                return {"success": True, "content": final_content}
 
-                    # 定义监视器逻辑：每100ms检查一次中断信号
-                    async def _monitor_interrupts(target_task):
-                        while not target_task.done():
-                            is_interrupted = False
-                            if cancel_event is not None and cancel_event.is_set():
-                                is_interrupted = True
-                            else:
-                                try:
-                                    from server import PromptServer
-                                    if hasattr(PromptServer.instance, 'execution_interrupted') and PromptServer.instance.execution_interrupted:
-                                        is_interrupted = True
-                                except:
-                                    pass
-                            
-                            if is_interrupted:
-                                target_task.cancel()
-                                return True
-                            await asyncio.sleep(0.1)
-                        return False
+                        # 定义监视器逻辑：每100ms检查一次中断信号
+                        async def _monitor_interrupts(target_task):
+                            while not target_task.done():
+                                is_interrupted = False
+                                if cancel_event is not None and cancel_event.is_set():
+                                    is_interrupted = True
+                                else:
+                                    try:
+                                        from server import PromptServer
+                                        if hasattr(PromptServer.instance, 'execution_interrupted') and PromptServer.instance.execution_interrupted:
+                                            is_interrupted = True
+                                    except:
+                                        pass
+                                
+                                if is_interrupted:
+                                    target_task.cancel()
+                                    return True
+                                await asyncio.sleep(0.1)
+                            return False
 
-                    # 并发运行请求和监视器
-                    req_task = asyncio.create_task(_request_core())
-                    monitor_task = asyncio.create_task(_monitor_interrupts(req_task))
-                    
-                    try:
-                        result = await req_task
-                        # 关键修复：API 返回错误时，确保进度条被停止
-                        if not result.get("success") and not result.get("interrupted"):
-                            if not getattr(pbar, '_closed', False):
-                                pbar.error(result.get("error", "API 错误"))
-                        return result
-                    except asyncio.CancelledError:
-                        pbar.cancel(f"{WARN_PREFIX} 任务被中断 | 服务:{provider_display_name}")
-                        return {"success": False, "error": "中断", "interrupted": True}
-                    finally:
-                        if not monitor_task.done():
-                            monitor_task.cancel()
-
-                # 执行请求
-                try:
-                    result = await _do_stream_request()
-                except Exception as req_err:
-                    # 网络层面的异常（非HTTP响应），通常不适合通过参数降级解决，除非确认是特定的协议问题
-                    # 这里选择继续抛出或作为错误返回，不盲目重试
-                    # 但为了稳健，如果是非连接已建立后的错误，可以选择不重试
-                    # 为简单起见，仅记录错误
-                    if 'pbar' in locals() and pbar:
-                        pbar.error(f"网络请求异常: {req_err}")
-                    return {"success": False, "error": f"网络请求异常: {req_err}"}
-
-                # 检查结果
-                if result["success"]:
-                    # Ollama 服务成功后尝试卸载模型
-                    if provider_display_name.lower().find("ollama") != -1:
+                        # 并发运行请求和监视器
+                        req_task = asyncio.create_task(_request_core())
+                        monitor_task = asyncio.create_task(_monitor_interrupts(req_task))
+                        
                         try:
-                            from ..config_manager import config_manager
-                            service_config = config_manager.get_service(provider_display_name) or {}
-                            await cls._unload_ollama_model(model, service_config)
-                        except:
-                            pass
-                    return result
-                
-                if result.get("interrupted"):
-                    return result
+                            result = await req_task
+                            # 关键修复：API 返回错误时，确保进度条被停止
+                            if not result.get("success") and not result.get("interrupted"):
+                                if not getattr(pbar, '_closed', False):
+                                    pbar.error(result.get("error", "API 错误"))
+                            return result
+                        except asyncio.CancelledError:
+                            pbar.cancel(f"{WARN_PREFIX} 任务被中断 | 服务:{provider_display_name}")
+                            return {"success": False, "error": "中断", "interrupted": True}
+                        finally:
+                            if not monitor_task.done():
+                                monitor_task.cancel()
 
-                last_error_msg = result["error"]
-                
-                # 只有 should_retry 为 True (HTTP 400) 且还有重试机会时，才继续循环
-                if not result.get("should_retry"):
-                    break # 非400错误（如401, 500等），不进行降级重试，直接返回错误
+                    # 执行请求
+                    try:
+                        result = await _do_stream_request()
+                    except Exception as req_err:
+                        # 网络层面的异常（非HTTP响应），通常不适合通过参数降级解决，除非确认是特定的协议问题
+                        # 这里选择继续抛出或作为错误返回，不盲目重试
+                        # 但为了稳健，如果是非连接已建立后的错误，可以选择不重试
+                        # 为简单起见，仅记录错误
+                        if 'pbar' in locals() and pbar:
+                            pbar.error(f"网络请求异常: {req_err}")
+                        return {"success": False, "error": f"网络请求异常: {req_err}"}
+
+                    # 检查结果
+                    if result["success"]:
+                        # Ollama 服务成功后尝试卸载模型
+                        if provider_display_name.lower().find("ollama") != -1:
+                            try:
+                                from ..config_manager import config_manager
+                                service_config = config_manager.get_service(provider_display_name) or {}
+                                await cls._unload_ollama_model(candidate_model, service_config)
+                            except:
+                                pass
+                        return result
+                    
+                    if result.get("interrupted"):
+                        return result
+
+                    last_error_msg = result["error"]
+                    
+                    # 只有 should_retry 为 True (HTTP 400) 且还有重试机会时，才继续循环
+                    if not result.get("should_retry"):
+                        break # 非400错误（如401, 500等），不进行降级重试，直接返回错误
+
+                # 当前模型尝试结束后，若不是 z.ai 余额不足场景，不再切换下一模型
+                if not cls._is_zai_balance_error(last_error_msg):
+                    break
             
             # 所有重试耗尽或非可重试错误
             if 'pbar' in locals() and pbar:
